@@ -19,8 +19,10 @@ from docutils import nodes, writers
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 # noinspection PyUnresolvedReferences
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_PARAGRAPH_ALIGNMENT
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+from docx.shared import Cm, Inches
 # noinspection PyProtectedMember
 from docx.table import _Cell
 
@@ -121,6 +123,8 @@ class DocxState(object):
         self.more_cols = 0
         self.row = None
         self.cell_counter = 0
+        self.next_figure_num = 1
+        "Next figure number to assign"
         self.ncolumns = 1
         "Number of columns in the current table."
 
@@ -147,8 +151,10 @@ class DocxTranslator(nodes.NodeVisitor):
 
         self.table_style_default = 'Medium Grid 1 Accent 1'
         self.in_literal_block = False
+        self.in_figure = False
         self.strong = False
         self.emphasis = False
+        self.center = False
 
         self.current_state = DocxState(location=self.docx_container)
         self.current_state.table_style = self.table_style_default
@@ -157,7 +163,7 @@ class DocxTranslator(nodes.NodeVisitor):
         self.old_states = []
         "A list of older states, e.g. typically [document, table-cell]"
 
-        self.current_paragraph = None
+        self.current_paragraph = self.current_state.location.add_paragraph("")
         "The current paragraph that text is being added to."
 
     def add_text(self, text):
@@ -167,6 +173,48 @@ class DocxTranslator(nodes.NodeVisitor):
             textrun.bold = True
         if self.emphasis:
             textrun.italic = True
+
+    def add_paragraph(self, dest, text='', style=None):
+        p = dest.add_paragraph(text, style)
+
+        if self.center:
+            p.paragraph_format.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
+        return p
+
+    def add_seq_field(self, field_type, contents):
+        paragraph = self.current_paragraph
+        run = paragraph.add_run()
+        r = run._r
+
+        fldChar = OxmlElement('w:fldChar')
+        fldChar.set(qn('w:fldCharType'), 'begin')
+        r.append(fldChar)
+
+        run = paragraph.add_run()
+        r = run._r
+
+        instrText = OxmlElement('w:instrText')
+        instrText.set(qn('xml:space'), 'preserve')
+        logger.info(' SEQ {} \* ARABIC'.format(field_type))
+        instrText.text = ' SEQ {} \* ARABIC '.format(field_type)
+        r.append(instrText)
+
+        run = paragraph.add_run()
+        r = run._r
+
+        fldChar = OxmlElement('w:fldChar')
+        fldChar.set(qn('w:fldCharType'), 'separate')
+        r.append(fldChar)
+
+        paragraph.add_run(str(contents))
+
+        run = paragraph.add_run()
+        r = run._r
+
+        fldChar = OxmlElement('w:fldChar')
+        fldChar.set(qn('w:fldCharType'), 'end')
+        r.append(fldChar)
 
     def new_state(self, location):
         dprint()
@@ -247,41 +295,38 @@ class DocxTranslator(nodes.NodeVisitor):
         # FIXME: figure text become normal paragraph instead of caption.
         dprint()
 
-        logger.info('ATTRIBUTES:FIGURE:{}'.format(repr(node.attlist())))
+        logger.info('ATTRIBUTES:FIGURE:{}'.format(node.attributes))
+        self.in_figure = True
+        curloc = self.current_state.location
+        logger.info('CURRENT_LOC:FIGURE:{}'.format(repr(curloc)))
 
-        # curloc = self.current_state.location
-        #
-        # if 'List' in self.current_paragraph.style.name and not self.current_paragraph.text:
-        #     # This is the first paragraph in a list item, so do not create another one.
-        #     pass
-        # elif isinstance(curloc, _Cell):
-        #     if len(curloc.paragraphs) == 1:
-        #         if not curloc.paragraphs[0].text:
-        #             # An empty paragraph is created when a Cell is created.
-        #             # Reuse this paragraph.
-        #             self.current_paragraph = curloc.paragraphs[0]
-        #         else:
-        #             self.current_paragraph = curloc.add_paragraph()
-        #     else:
-        #         self.current_paragraph = curloc.add_paragraph()
-        #     # HACK because the style is messed up, TODO FIX
-        #     self.current_paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        #     self.current_paragraph.paragraph_format.left_indent = 0
-        # else:
-        #     self.current_paragraph = curloc.add_paragraph()
-        # uri = node.attributes['uri']
-        # file_path = os.path.join(self.builder.env.srcdir, uri)
-        # self.docx_container.add_picture(file_path)  # width=Inches(1.25))
-        # .. todo:: 'width' keyword is not supported
+        if 'align' in node.attributes:
+            if node.attributes['align'] == 'center':
+                self.center = True
 
-    depart_figure = just_print
+    def depart_figure(self, node):
+        dprint()
+        self.in_figure = False
+        if 'align' in node.attributes and 'center' == node.attributes['align']:
+            self.center = False
 
     def visit_caption(self, node):
         dprint()
 
         logger.info('ATTRIBUTES:FIGURE:{}'.format(repr(node.attlist())))
+        curloc = self.current_state.location
 
-    depart_caption = just_print
+        contents = None
+        if self.in_figure:
+            contents = self.current_state.next_figure_num
+            self.current_state.next_figure_num += 1
+
+        self.current_paragraph = self.add_paragraph(curloc, 'Figure ', style='Caption')
+        self.add_seq_field('Figure', contents)
+        self.current_paragraph.add_run(': ')
+
+    def depart_caption(self, node):
+        self.current_paragraph = self.add_paragraph(self.current_state.location)
 
     def visit_tabular_col_spec(self, node):
         dprint()
@@ -397,7 +442,7 @@ class DocxTranslator(nodes.NodeVisitor):
 
         # Add an empty paragraph to prevent tables from being concatenated.
         # TODO: Figure out some better solution.
-        self.current_state.location.add_paragraph("")
+        self.add_paragraph(self.current_state.location, "")
 
     def visit_Text(self, node):
         dprint()
@@ -415,10 +460,25 @@ class DocxTranslator(nodes.NodeVisitor):
 
     def visit_image(self, node):
         dprint()
-        logger.info('ATTRIBUTES:FIGURE:{}'.format(repr(node.attlist())))
+        logger.info('ATTRIBUTES:FIGURE:{}'.format(repr(node.attributes)))
         uri = node.attributes['uri']
         file_path = os.path.join(self.builder.env.srcdir, uri)
-        self.docx_container.add_picture(file_path)  # width=Inches(1.25))
+        dest = self.docx_container
+        if self.in_figure:
+            self.current_paragraph = self.add_paragraph(self.current_state.location)
+            dest = self.current_paragraph.add_run()
+
+        width = None
+        height = None
+
+        if 'height' in node.attributes:
+            height = Inches(float(node.attributes['height'][0:-2]))
+
+        if 'width' in node.attributes:
+            width = Inches(float(node.attributes['width'][0:-2]))
+
+        logger.info("width: {}, height: {}".format(width, height))
+        dest.add_picture(file_path, height=height, width=width)
         # .. todo:: 'width' keyword is not supported
 
     depart_image = just_print
@@ -472,11 +532,11 @@ class DocxTranslator(nodes.NodeVisitor):
                     self.current_paragraph = curloc.paragraphs[0]
                     self.current_paragraph.style = style
                 else:
-                    self.current_paragraph = curloc.add_paragraph(style=style)
+                    self.current_paragraph = self.add_paragraph(curloc, style=style)
             else:
-                self.current_paragraph = curloc.add_paragraph(style=style)
+                self.current_paragraph = self.add_paragraph(curloc, style=style)
         else:
-            self.current_paragraph = curloc.add_paragraph(style=style)
+            self.current_paragraph = self.add_paragraph(curloc, style=style)
 
     depart_list_item = just_print
 
@@ -495,14 +555,14 @@ class DocxTranslator(nodes.NodeVisitor):
                     # Reuse this paragraph.
                     self.current_paragraph = curloc.paragraphs[0]
                 else:
-                    self.current_paragraph = curloc.add_paragraph()
+                    self.current_paragraph = self.add_paragraph(curloc)
             else:
-                self.current_paragraph = curloc.add_paragraph()
+                self.current_paragraph = self.add_paragraph(curloc)
             # HACK because the style is messed up, TODO FIX
-            self.current_paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            self.current_paragraph.paragraph_format.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
             self.current_paragraph.paragraph_format.left_indent = 0
         else:
-            self.current_paragraph = curloc.add_paragraph()
+            self.current_paragraph = self.add_paragraph(curloc)
 
     depart_paragraph = just_print
 
@@ -525,9 +585,8 @@ class DocxTranslator(nodes.NodeVisitor):
             logger.warning(msg)
             style = None
 
-        self.current_paragraph = self.current_state.location.add_paragraph(
-            style=style)
-        self.current_paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        self.current_paragraph = self.add_paragraph(self.current_state.location, style=style)
+        self.current_paragraph.paragraph_format.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
 
     def depart_literal_block(self, node):
         dprint()
